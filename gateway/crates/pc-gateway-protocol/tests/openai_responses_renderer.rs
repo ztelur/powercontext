@@ -155,7 +155,9 @@ fn structured_output_via_text_field_reaches_wire() {
         tools: vec![],
         instructions: None,
         native_cache_fields: None,
-        output_limits: OutputLimits { max_output_tokens: 64 },
+        output_limits: OutputLimits {
+            max_output_tokens: 64,
+        },
         stream: false,
         response_format: Some(serde_json::json!({
             "format": {
@@ -169,8 +171,14 @@ fn structured_output_via_text_field_reaches_wire() {
     let p = OpenAiResponsesRenderer.render(&req, None).unwrap();
     let v: serde_json::Value = serde_json::from_slice(&p.bytes).unwrap();
     // 上游载荷必须有 "text"（不是 "response_format"——那是 Chat 字段）
-    assert!(v.get("text").is_some(), "text 字段必须存在于 Responses wire body");
+    assert!(
+        v.get("text").is_some(),
+        "text 字段必须存在于 Responses wire body"
+    );
     assert_eq!(v["text"]["format"]["type"], "json_schema");
     assert_eq!(v["text"]["format"]["name"], "my_output");
-    assert!(v.get("response_format").is_none(), "response_format 不得出现在 Responses wire body");
+    assert!(
+        v.get("response_format").is_none(),
+        "response_format 不得出现在 Responses wire body"
+    );
 }
