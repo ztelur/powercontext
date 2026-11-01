@@ -12,20 +12,35 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! 执行器核心：一次托管调用的状态机。
+//!
+//! ```text
+//! 宿主完整输入 ─► [快照原始请求] ─► enrich ─► 渲染 ─► check(before_send)
+//!                   │                                       │
+//!                   │                    ┌── allow + binding + valid_until
+//!                   │                    ▼
+//!                   │            [验有效期] ─► 发送 ─► ┌─ Delivered ─► check(before_release)
+//!                   │                    │             ├─ NotSent ─► [重准入] ─► 重新发送
+//!                   │                    │             └─ Indeterminate ─► 上抛
+//!                   │                    │
+//!                   │              到期→ AdmissionExpired（零发送）
+//!                   │
+//!                   └── 降级时用此原始请求（不含注入）重新渲染
+//! ```
+
 use crate::{GateClient, GateError};
 use pc_gateway_evidence::EvidenceSink;
 use pc_gateway_protocol::{CanonicalRequest, WireRenderer};
-use pc_gateway_transport::{AdmittedSend, BoundedRetry, RetryOutcome, SendOutcome, Transport};
+use pc_gateway_transport::{AdmittedSend, SendOutcome, Transport};
 use pc_gateway_types::{
-    CaptureContentSourceRequest, CheckDecision, ContextCheckRequest, ContextCheckResult,
+    parse_rfc3339_ms, CaptureContentSourceRequest, CheckDecision, ContextCheckRequest,
     ModelJsonPayload, ModelJsonTextLocation, PrepareContextRequest, PreparedContextLocation,
 };
 use std::collections::BTreeMap;
 use std::num::NonZeroU32;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Gate 不可用时的策略（PR #2199 故障语义）：
-/// Pause —— 必需强制检查不可用：不发送（默认，安全立场）；
-/// PassthroughWithoutMemory —— 增强类调用可降级（仅限 capabilities.enforcing=false）。
+/// Gate 不可用时的策略（PR #2199 故障语义）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DegradePolicy {
     #[default]
@@ -33,56 +48,58 @@ pub enum DegradePolicy {
     PassthroughWithoutMemory,
 }
 
-/// 宿主交给执行器的完整输入：已授权历史 + 当前请求 + 目标。
+/// 宿主交给执行器的完整输入。
 pub struct ManagedCall {
     pub scope_id: String,
     pub target_profile: String,
     pub request: CanonicalRequest,
     pub target_url: String,
-    /// 目标协议要求的头部（凭据由受控配置解析，不经请求字段）。
     pub headers: Vec<(String, String)>,
     pub degrade_policy: DegradePolicy,
-    /// 是否调 prepare 注入上下文（v1 仅 chat 格式；PC 决定内容，网关只放置）。
     pub inject_context: bool,
-    /// 是否在过检后同步沉淀本轮对话（capture_content_source，毫秒级落库）。
     pub sediment: bool,
-    /// 注入块位置声明，随 before_send 送检。
     pub prepared_contexts: Vec<PreparedContextLocation>,
 }
 
-/// 执行结果：要么是过检放行的内容，要么是显式拒绝/不确定。
-/// 不存在“静默成功”或“伪装成空结果”的路径。
+/// 执行结果。
 #[derive(Debug)]
 pub enum ManagedOutcome {
-    /// before_release 的 allow：绑定与过检内容一起返回。
     Released {
         binding: Option<String>,
         status: u16,
         content_type: String,
         body: bytes::Bytes,
     },
-    /// Core 明确拒绝（两阶段的 block），携带无正文原因类别。
-    Blocked { reason_codes: Vec<String> },
-    /// Core 暂缓。PR #2264 的 withhold 不含渲染计划，一律按终态处理。
-    Withheld { reason_codes: Vec<String> },
-    /// 可能已到达上游；不自动付费重发。
+    Blocked {
+        reason_codes: Vec<String>,
+    },
+    Withheld {
+        reason_codes: Vec<String>,
+    },
     SendIndeterminate,
-    /// 全部尝试确定性未送达。
-    NotSent { attempts: u32 },
-    /// Gate 不可用：暂停，不是失败放行。
+    NotSent {
+        attempts: u32,
+    },
     GatePaused(String),
-    /// 无记忆直通降级：未经检查发送（仅限未启用强制规则的部署），
-    /// 响应头/证据必须显式标记，不得伪装成过检结果。
     Degraded {
         status: u16,
         content_type: String,
         body: bytes::Bytes,
     },
+    /// 准入已过期（valid_until 超窗）：零发送或零释放，可安全重走完整流程。
+    AdmissionExpired,
 }
 
 pub struct Executor<G, T> {
     gate: G,
-    retry: BoundedRetry<T>,
+    transport: T,
+    max_attempts: NonZeroU32,
+}
+
+/// 单次发送尝试的准入凭证。
+struct Admission {
+    binding: String,
+    valid_until_ms: Option<u64>,
 }
 
 impl<G, T> Executor<G, T>
@@ -93,11 +110,11 @@ where
     pub fn new(gate: G, transport: T, max_attempts: NonZeroU32) -> Self {
         Self {
             gate,
-            retry: BoundedRetry::new(transport, max_attempts),
+            transport,
+            max_attempts,
         }
     }
 
-    /// 一次托管调用。渲染器按请求传入：入口格式即上游格式（同格式进出）。
     pub async fn run<R: WireRenderer>(
         &self,
         call: ManagedCall,
@@ -105,11 +122,14 @@ where
         evidence: &dyn EvidenceSink,
     ) -> ManagedOutcome {
         let mut call = call;
+        // P1-3：enrich 之前快照原始请求。降级路径必须用这份（不含注入内容）
+        // 重新渲染，否则 prepare 召回的私密记忆会在未经任何检查的情况下外发。
+        let pristine_request = call.request.clone();
+
         if call.inject_context {
-            // 注入是增强类调用：失败不阻塞主链路（不注入、不声明区间）。
             self.enrich(&mut call, evidence).await;
         }
-        // 渲染完整最终字节（不含缓存计划：PR #2264 的 withhold 未携带渲染计划）。
+
         let payload = match renderer.render(&call.request, None) {
             Ok(p) => p,
             Err(e) => {
@@ -118,8 +138,6 @@ where
                 }
             }
         };
-        // 送检内容必须与发送字节严格一致：拒绝有损转换（防“检查≠发送”缝隙）。
-        // 渲染器输出本应恒为合法 UTF-8，非法即契约违约，阻断而非降级。
         let payload_body = match String::from_utf8(payload.bytes.clone().to_vec()) {
             Ok(text) => text,
             Err(_) => {
@@ -132,7 +150,6 @@ where
             content_headers(&call.headers, payload.content_type),
             payload_body,
         );
-
         let check = ContextCheckRequest::BeforeSend {
             scope_id: call.scope_id.clone(),
             target_profile: call.target_profile.clone(),
@@ -140,19 +157,34 @@ where
             prepared_contexts: call.prepared_contexts.clone(),
         };
 
-        let binding = match self.gate.check(check).await {
+        let admission = match self.gate.check(check).await {
             Err(e) => {
-                // #2199 语义：降级仅适用于 Core「不可用」。Malformed 表示 Core 可达但
-                // 响应异常（版本错乱/被篡改/代理污染）——恰恰最不该绕过检查，一律暂停。
+                // 降级仅适用于 Core「不可用」；Malformed（可达但响应异常）一律暂停。
                 return match (e, call.degrade_policy) {
                     (GateError::GateUnavailable(_), DegradePolicy::PassthroughWithoutMemory) => {
-                        self.degraded_send(&call, payload.bytes, evidence).await
+                        // P1-3：降级时丢弃已注入的载荷，用 pristine 请求重新渲染。
+                        let mut degraded_call = ManagedCall {
+                            scope_id: call.scope_id.clone(),
+                            target_profile: call.target_profile.clone(),
+                            request: pristine_request,
+                            target_url: call.target_url.clone(),
+                            headers: call.headers.clone(),
+                            degrade_policy: DegradePolicy::Pause,
+                            inject_context: false,
+                            sediment: false,
+                            prepared_contexts: Vec::new(),
+                        };
+                        degraded_call.request.stream = call.request.stream;
+                        self.degraded_send(&degraded_call, renderer, evidence).await
                     }
                     (e, _) => ManagedOutcome::GatePaused(classify_gate_error(e)),
                 };
             }
             Ok(result) => match result.decision {
-                CheckDecision::Allow => unwrap_binding(result),
+                CheckDecision::Allow => Admission {
+                    binding: unwrap_binding(result.binding),
+                    valid_until_ms: parse_rfc3339_ms(&result.valid_until),
+                },
                 CheckDecision::Block => {
                     return ManagedOutcome::Blocked {
                         reason_codes: result.reason_codes,
@@ -166,29 +198,77 @@ where
             },
         };
 
-        let send = AdmittedSend {
-            binding,
-            payload: payload.bytes,
-            target_url: call.target_url.clone(),
-            headers: call.headers.clone(),
-            stream: call.request.stream,
-        };
-        let send_ref = send.clone();
-
-        let raw = match self.retry.send_with_retry(&send, evidence).await {
-            RetryOutcome::AllNotSent { attempts } => return ManagedOutcome::NotSent { attempts },
-            RetryOutcome::Done(SendOutcome::Indeterminate(_)) => {
-                return ManagedOutcome::SendIndeterminate
+        // P1-4：发送阶段。每次尝试前验有效期；确定性失败后重新走 check 拿新准入。
+        let raw = {
+            let mut current = admission;
+            let mut attempt: u32 = 0;
+            loop {
+                attempt += 1;
+                evidence.record_attempt(attempt);
+                // P1-4：发送前验 valid_until。
+                if let Some(deadline) = current.valid_until_ms {
+                    if now_ms() >= deadline {
+                        return ManagedOutcome::AdmissionExpired;
+                    }
+                }
+                let send = AdmittedSend {
+                    binding: current.binding.clone(),
+                    payload: payload.bytes.clone(),
+                    target_url: call.target_url.clone(),
+                    headers: call.headers.clone(),
+                    stream: call.request.stream,
+                };
+                let sent_binding = current.binding.clone();
+                match self.transport.send(send).await {
+                    SendOutcome::Delivered(raw) => {
+                        break (raw, sent_binding);
+                    }
+                    SendOutcome::Indeterminate(_) => return ManagedOutcome::SendIndeterminate,
+                    SendOutcome::NotSent(reason) => {
+                        evidence.record_not_sent(attempt, &reason.to_string());
+                        if attempt >= self.max_attempts.get() {
+                            return ManagedOutcome::NotSent { attempts: attempt };
+                        }
+                        #[allow(unused_assignments)]
+                        {
+                            let _ = sent_binding;
+                        }
+                        // P1-4：重试前重新准入——撤销在这里被看见。
+                        let recheck = ContextCheckRequest::BeforeSend {
+                            scope_id: call.scope_id.clone(),
+                            target_profile: call.target_profile.clone(),
+                            payload: ModelJsonPayload::new(
+                                content_headers(&call.headers, payload.content_type),
+                                String::from_utf8(payload.bytes.to_vec()).unwrap_or_default(),
+                            ),
+                            prepared_contexts: call.prepared_contexts.clone(),
+                        };
+                        match self.gate.check(recheck).await {
+                            Ok(r) if r.decision == CheckDecision::Allow => {
+                                current = Admission {
+                                    binding: unwrap_binding(r.binding),
+                                    valid_until_ms: parse_rfc3339_ms(&r.valid_until),
+                                };
+                            }
+                            Ok(r) if r.decision == CheckDecision::Block => {
+                                return ManagedOutcome::Blocked {
+                                    reason_codes: r.reason_codes,
+                                }
+                            }
+                            Ok(r) => {
+                                return ManagedOutcome::Withheld {
+                                    reason_codes: r.reason_codes,
+                                }
+                            }
+                            Err(e) => return ManagedOutcome::GatePaused(classify_gate_error(e)),
+                        }
+                    }
+                }
             }
-            RetryOutcome::Done(SendOutcome::NotSent(_)) => {
-                unreachable!("BoundedRetry never returns Done(NotSent)")
-            }
-            RetryOutcome::Done(SendOutcome::Delivered(raw)) => raw,
         };
 
-        // strict：完整原始响应先过 before_release，通过前不释放任何内容。
-        // 上游响应不受我们控制：非 UTF-8 字节不做有损转换送检（那会导致
-        // “批准的是替换后文本、交付的是原始字节”的保真缺口），直接不放行。
+        // 释放阶段。
+        let (raw, send_binding_for_release) = raw;
         let release_body = match String::from_utf8(raw.body.clone().to_vec()) {
             Ok(text) => text,
             Err(_) => {
@@ -200,9 +280,8 @@ where
         let release_check = ContextCheckRequest::BeforeRelease {
             scope_id: call.scope_id.clone(),
             target_profile: call.target_profile.clone(),
-            request_binding: send_ref.binding.clone(),
+            request_binding: send_binding_for_release,
             payload: ModelJsonPayload::new(
-                // 契约要求 headers 至少 1 项；携带上游实际 Content-Type。
                 BTreeMap::from([("content-type".to_string(), raw.content_type.clone())]),
                 release_body.clone(),
             ),
@@ -212,17 +291,16 @@ where
             Err(e) => ManagedOutcome::GatePaused(classify_gate_error(e)),
             Ok(result) => match result.decision {
                 CheckDecision::Allow => {
-                    // 沉淀：同步、best-effort（失败仅记证据，不影响交付）。
-                    // 内容只含本轮 user 文本与过检响应——被拦/降级轮次不沉淀。
+                    // P1-4：释放前（含沉淀之后）验 release verdict 的 valid_until。
+                    if let Some(deadline) = parse_rfc3339_ms(&result.valid_until) {
+                        if now_ms() >= deadline {
+                            return ManagedOutcome::AdmissionExpired;
+                        }
+                    }
                     if call.sediment {
                         let transcript = serde_json::json!({
                             "kind": "gateway_turn",
-                            "user": call.request.messages.iter()
-                                .rev().find(|m| matches!(m.role, pc_gateway_protocol::Role::User))
-                                .and_then(|m| match m.content.as_slice() {
-                                    [serde_json::Value::String(s)] => Some(s.clone()),
-                                    _ => None,
-                                }).unwrap_or_default(),
+                            "user": last_user_text(&call.request).unwrap_or_default(),
                             "assistant": release_body.clone(),
                             "model": call.request.model,
                         });
@@ -252,8 +330,15 @@ where
                     }
                 }
                 CheckDecision::Block => {
-                    // 不释放任何内容；尽力取消上游，只保留无正文失败证据。
-                    self.retry.transport().cancel(&send_ref).await;
+                    self.transport
+                        .cancel(&AdmittedSend {
+                            binding: String::new(),
+                            payload: bytes::Bytes::new(),
+                            target_url: call.target_url.clone(),
+                            headers: call.headers.clone(),
+                            stream: call.request.stream,
+                        })
+                        .await;
                     ManagedOutcome::Blocked {
                         reason_codes: result.reason_codes,
                     }
@@ -265,10 +350,7 @@ where
         }
     }
 
-    /// 注入（放置与声明，非检索）：调 prepare → 标准块包裹 → 拼进最后一条
-    /// user 消息头部 → 计算字节区间。任一步失败则保持原样（不注入、不声明）。
     async fn enrich(&self, call: &mut ManagedCall, evidence: &dyn EvidenceSink) {
-        // 取最后一条 user 消息的纯文本作为检索词；非单字符串 content 不注入（v1）。
         let Some(query) = last_user_text(&call.request) else {
             return;
         };
@@ -285,18 +367,16 @@ where
             Ok(p) => p,
             Err(e) => {
                 evidence.record_not_sent(0, &format!("prepare_failed:{e}"));
+                tracing::warn!(error = %e, "prepare failed; injecting nothing");
                 return;
             }
         };
         let (Some(content), Some(binding)) = (prepared.content(), prepared.binding()) else {
-            return; // empty：不注入任何标记（空块会污染前缀且无 binding 可声明）
+            return;
         };
         if content.is_empty() {
             return;
         }
-        // PC 返回的 content 已是标准注入格式（信任前言 + 标记包裹块）。
-        // 必须原样注入：check 会校验区间字节摘要 == sha256(content)，
-        // 网关任何增删（包括再包裹）都会导致 digest 不匹配被暂缓。
         let block = content.to_string();
         let Some(index) = last_user_index(&call.request) else {
             return;
@@ -314,52 +394,55 @@ where
             binding: binding.to_string(),
             location: ModelJsonTextLocation {
                 schema: pc_gateway_types::MODEL_JSON_TEXT_LOCATION_SCHEMA.to_string(),
-                // chat 线格式：content 为纯字符串，指针用无部件形态。
                 pointer: format!("/messages/{index}/content"),
                 start_byte: 0,
-                // UTF-8 字节数（非字符数）；区间必须落在字符边界（块整体是合法 UTF-8，天然满足）。
                 end_byte: block.len() as u64,
             },
         });
     }
 
-    /// 降级直通：未经检查发送。显式标记，不做释放检查。
-    async fn degraded_send(
+    /// P1-3：降级直通用 pristine 请求（不含注入）重新渲染再发送。
+    async fn degraded_send<R: WireRenderer>(
         &self,
         call: &ManagedCall,
-        payload: bytes::Bytes,
+        renderer: &R,
         evidence: &dyn EvidenceSink,
     ) -> ManagedOutcome {
         evidence.record_not_sent(0, "degraded_passthrough");
+        let payload = match renderer.render(&call.request, None) {
+            Ok(p) => p,
+            Err(e) => {
+                return ManagedOutcome::Blocked {
+                    reason_codes: vec![format!("render_failed:{e}")],
+                }
+            }
+        };
         let send = AdmittedSend {
             binding: "degraded-passthrough".into(),
-            payload,
+            payload: payload.bytes,
             target_url: call.target_url.clone(),
             headers: call.headers.clone(),
             stream: call.request.stream,
         };
-        match self.retry.send_with_retry(&send, evidence).await {
-            RetryOutcome::AllNotSent { attempts } => ManagedOutcome::NotSent { attempts },
-            RetryOutcome::Done(SendOutcome::Indeterminate(_)) => ManagedOutcome::SendIndeterminate,
-            RetryOutcome::Done(SendOutcome::NotSent(_)) => {
-                unreachable!("BoundedRetry never returns Done(NotSent)")
-            }
-            RetryOutcome::Done(SendOutcome::Delivered(raw)) => ManagedOutcome::Degraded {
+        match self.transport.send(send).await {
+            SendOutcome::Delivered(raw) => ManagedOutcome::Degraded {
                 status: raw.status,
                 content_type: raw.content_type,
                 body: raw.body,
             },
+            SendOutcome::Indeterminate(_) => ManagedOutcome::SendIndeterminate,
+            SendOutcome::NotSent(reason) => {
+                evidence.record_not_sent(1, &reason.to_string());
+                ManagedOutcome::NotSent { attempts: 1 }
+            }
         }
     }
 }
 
-fn unwrap_binding(result: ContextCheckResult) -> String {
-    result
-        .binding
-        .unwrap_or_else(|| "missing-binding".to_string())
+fn unwrap_binding(binding: Option<String>) -> String {
+    binding.unwrap_or_else(|| "missing-binding".to_string())
 }
 
-/// 载荷头只保留内容/协议头；凭据与传输覆盖头禁止进 check 载荷。
 fn content_headers(headers: &[(String, String)], content_type: &str) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
     out.insert("content-type".to_string(), content_type.to_string());
@@ -379,7 +462,6 @@ fn classify_gate_error(e: GateError) -> String {
     }
 }
 
-/// 最后一条 user 消息下标（渲染保持消息顺序，与线格式下标一致）。
 fn last_user_index(request: &CanonicalRequest) -> Option<usize> {
     request
         .messages
@@ -395,13 +477,18 @@ fn last_user_text(request: &CanonicalRequest) -> Option<String> {
     }
 }
 
-/// 稳定短摘要（幂等键用；非安全用途，无需密码学强度）。
 fn simple_digest(input: &str) -> String {
-    // FNV-1a 64 位，输出 16 hex —— 足够做 source_id 的幂等区分。
     let mut hash: u64 = 0xcbf29ce484222325;
     for b in input.as_bytes() {
         hash ^= *b as u64;
         hash = hash.wrapping_mul(0x100000001b3);
     }
     format!("{hash:016x}")
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }

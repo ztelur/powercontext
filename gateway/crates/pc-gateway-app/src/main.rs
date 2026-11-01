@@ -61,6 +61,8 @@ pub struct AppState {
     pub default_scope: String,
     /// Request body byte limit (also enforced when consuming chunked bodies).
     pub max_body_bytes: usize,
+    /// 启动时查 capabilities 确定降级资格：enforcing=true 或查询失败 → 不允许。
+    pub degradation_allowed: bool,
 }
 
 #[tokio::main]
@@ -94,7 +96,7 @@ async fn main() {
 
     let state = Arc::new(AppState {
         executor: Arc::new(Executor::new(
-            core_link,
+            core_link.clone(),
             ReqwestTransport::new(Duration::from_secs(120)),
             NonZeroU32::new(max_attempts).expect("max_attempts > 0"),
         )),
@@ -121,6 +123,7 @@ async fn main() {
         default_scope: std::env::var("PC_GATEWAY_DEFAULT_SCOPE")
             .unwrap_or_else(|_| "gateway:default".into()),
         max_body_bytes,
+        degradation_allowed: resolve_degradation(core_link.clone()).await,
     });
 
     let router = Router::new()
@@ -159,6 +162,33 @@ async fn main() {
 async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
     tracing::info!("shutting down (draining)");
+}
+
+/// P1-3：启动时确定降级资格。
+/// capabilities 返回 enforcing=true → 不允许（Core 说了算）。
+/// 查询失败 → 不允许（fail-closed）。
+async fn resolve_degradation(link: link::CoreLink) -> bool {
+    use pc_gateway_core::GateClient;
+    match link.capabilities().await {
+        Ok(caps) => {
+            let enforcing = caps
+                .get("context_protection")
+                .and_then(|cp| cp.get("enforcing"))
+                .and_then(|e| e.as_bool())
+                .unwrap_or(true); // 缺字段 → fail-closed
+            let allowed = !enforcing;
+            tracing::info!(
+                enforcing,
+                allowed,
+                "degradation eligibility from capabilities"
+            );
+            allowed
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "capabilities unreachable; degradation disabled (fail-closed)");
+            false
+        }
+    }
 }
 
 async fn healthz() -> axum::Json<serde_json::Value> {

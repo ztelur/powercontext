@@ -190,7 +190,12 @@ async fn ingress_common(
             Format::Chat => &state.upstream_chat_api_key,
             Format::Responses => &state.upstream_responses_api_key,
         }),
-        degrade_policy: state.degrade,
+        // P1-3：降级资格由启动时 capabilities 查询决定，环境变量只是运维申请。
+        degrade_policy: if state.degradation_allowed {
+            state.degrade
+        } else {
+            pc_gateway_core::DegradePolicy::Pause
+        },
         inject_context: state.inject_context && matches!(format, Format::Chat),
         sediment: state.sediment,
         prepared_contexts: Vec::new(),
@@ -354,6 +359,11 @@ fn respond(outcome: ManagedOutcome) -> Response {
         ManagedOutcome::NotSent { attempts } => (
             StatusCode::BAD_GATEWAY,
             Json(serde_json::json!({ "decision": "not_sent", "attempts": attempts })),
+        )
+            .into_response(),
+        ManagedOutcome::AdmissionExpired => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "decision": "admission_expired" })),
         )
             .into_response(),
         ManagedOutcome::GatePaused(msg) => (

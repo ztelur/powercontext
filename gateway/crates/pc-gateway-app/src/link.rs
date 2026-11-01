@@ -20,6 +20,7 @@ use pc_gateway_types::{
     PrepareContextResult,
 };
 
+#[derive(Clone)]
 pub enum CoreLink {
     Uds(UdsGateClient),
     Http(HttpGateClient),

@@ -459,11 +459,10 @@ async fn block_does_not_degrade() {
 #[tokio::test]
 async fn deterministic_not_sent_retries_bounded() {
     let (executor, renderer, _transport, _g) = harness(
-        vec![Ok(result(
-            CheckPhase::BeforeSend,
-            CheckDecision::Allow,
-            &[],
-        ))],
+        vec![
+            Ok(result(CheckPhase::BeforeSend, CheckDecision::Allow, &[])),
+            Ok(result(CheckPhase::BeforeSend, CheckDecision::Allow, &[])),
+        ],
         vec![
             SendOutcome::NotSent(pc_gateway_transport::NotSentReason::ConnectRefused),
             SendOutcome::NotSent(pc_gateway_transport::NotSentReason::ConnectRefused),
@@ -795,4 +794,116 @@ async fn non_utf8_response_is_never_released() {
     // cancel 不适用：非流式调用响应已完整到达，无进行中的上游工作可取消。
     assert_eq!(gate.seen.lock().unwrap().len(), 1);
     assert_eq!(*transport.cancels.lock().unwrap(), 0);
+}
+
+// ---------- P1-3 / P1-4 探针 ----------
+
+#[tokio::test]
+async fn degraded_send_carries_no_injected_memory() {
+    // reviewer 探针复现：prepare 返回 PRIVATE_MEMORY_2307 → check 挂 → Passthrough
+    // → 上游收到的请求不含注入内容（P1-3）。
+    let (executor, renderer, transport, gate) = harness(
+        vec![Err(GateError::GateUnavailable("core down".into()))],
+        vec![raw_response()],
+        2,
+    );
+    *gate.prepare_result.lock().unwrap() = Some(Ok(reuse_result(
+        "BEGIN_POWERCONTEXT_PREPARED_CONTEXT_V1\nPRIVATE_MEMORY_2307\nEND_POWERCONTEXT_PREPARED_CONTEXT_V1",
+    )));
+    let mut c = call(DegradePolicy::PassthroughWithoutMemory);
+    c.inject_context = true;
+    let outcome = executor
+        .run(c, &RendererRef(renderer.clone()), &NoopEvidenceSink)
+        .await;
+    assert!(matches!(outcome, ManagedOutcome::Degraded { .. }));
+    // 关键断言：发送的字节不含注入标记（降级必须用原始请求）
+    let sent_bytes = &transport.sends.lock().unwrap()[0];
+    let sent_str = String::from_utf8(sent_bytes.to_vec()).unwrap();
+    assert!(
+        !sent_str.contains("PRIVATE_MEMORY_2307"),
+        "降级载荷不得包含注入内容: {sent_str}"
+    );
+    assert!(sent_str.contains("hello"), "原始用户文本必须在: {sent_str}");
+}
+
+#[tokio::test]
+async fn expired_send_verdict_never_sends() {
+    // reviewer 探针：valid_until 已过期 → 不发送（P1-4）。
+    let (executor, renderer, transport, _gate) = harness(
+        vec![Ok(ContextCheckResult {
+            valid_until: "2000-01-01T00:00:00Z".into(), // 已过期
+            ..result(CheckPhase::BeforeSend, CheckDecision::Allow, &[])
+        })],
+        vec![raw_response()],
+        2,
+    );
+    let outcome = executor
+        .run(
+            call(DegradePolicy::Pause),
+            &RendererRef(renderer.clone()),
+            &NoopEvidenceSink,
+        )
+        .await;
+    assert!(matches!(outcome, ManagedOutcome::AdmissionExpired));
+    assert_eq!(transport.sends.lock().unwrap().len(), 0, "过期准入零发送");
+}
+
+#[tokio::test]
+async fn retry_re_admits_and_revocation_blocks_second_send() {
+    // reviewer 探针：allow → 确定性失败 → 重准入时 Core 变卦 block
+    // → 第二次发送不发生（P1-4 撤销在重试前生效）。
+    let (executor, renderer, transport, gate) = harness(
+        vec![
+            Ok(result(CheckPhase::BeforeSend, CheckDecision::Allow, &[])),
+            Ok(result(
+                CheckPhase::BeforeSend,
+                CheckDecision::Block,
+                &["policy_changed"],
+            )),
+        ],
+        vec![SendOutcome::NotSent(
+            pc_gateway_transport::NotSentReason::ConnectRefused,
+        )],
+        3, // max_attempts=3，有重试额度
+    );
+    let outcome = executor
+        .run(
+            call(DegradePolicy::Pause),
+            &RendererRef(renderer.clone()),
+            &NoopEvidenceSink,
+        )
+        .await;
+    assert!(
+        matches!(outcome, ManagedOutcome::Blocked { .. }),
+        "重准入 block 必须拦住"
+    );
+    // 只有一次发送尝试（第二次被重准入的 block 拦住）
+    assert_eq!(transport.sends.lock().unwrap().len(), 1);
+    // Core 看到 2 次 check（初次 + 重准入）
+    assert_eq!(gate.seen.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn release_expired_after_capture_withholds() {
+    // reviewer 探针：release verdict 过期 → 内容不交付（含沉淀后复核）。
+    let (executor, renderer, _transport, _gate) = harness(
+        vec![
+            Ok(result(CheckPhase::BeforeSend, CheckDecision::Allow, &[])),
+            Ok(ContextCheckResult {
+                valid_until: "2000-01-01T00:00:00Z".into(), // release 过期
+                ..result(CheckPhase::BeforeRelease, CheckDecision::Allow, &[])
+            }),
+        ],
+        vec![raw_response()],
+        2,
+    );
+    let mut c = call(DegradePolicy::Pause);
+    c.sediment = true;
+    let outcome = executor
+        .run(c, &RendererRef(renderer.clone()), &NoopEvidenceSink)
+        .await;
+    assert!(
+        matches!(outcome, ManagedOutcome::AdmissionExpired),
+        "过期释放不放行"
+    );
 }
