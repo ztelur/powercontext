@@ -33,6 +33,8 @@ fn request() -> CanonicalRequest {
             max_output_tokens: 16,
         },
         stream: false,
+        response_format: None,
+        tool_choice: None,
     }
 }
 
@@ -117,6 +119,8 @@ fn tool_call_metadata_round_trip_preserved() {
             max_output_tokens: 16,
         },
         stream: false,
+        response_format: None,
+        tool_choice: None,
     };
     let p = OpenAiChatRenderer.render(&req, None).unwrap();
     let v: serde_json::Value = serde_json::from_slice(&p.bytes).unwrap();

@@ -99,6 +99,12 @@ impl WireRenderer for OpenAiChatRenderer {
         if !request.tools.is_empty() {
             body["tools"] = serde_json::json!(request.tools);
         }
+        if let Some(rf) = &request.response_format {
+            body["response_format"] = rf.clone();
+        }
+        if let Some(tc) = &request.tool_choice {
+            body["tool_choice"] = tc.clone();
+        }
         if let Some(fields) = request.native_cache_fields.as_ref() {
             merge_top_level(&mut body, fields).map_err(|_| RenderError::InvalidRenderPlan {
                 renderer: self.name(),
@@ -251,6 +257,12 @@ impl WireRenderer for OpenAiResponsesRenderer {
         }
         if !request.tools.is_empty() {
             body["tools"] = serde_json::json!(request.tools);
+        }
+        if let Some(rf) = &request.response_format {
+            body["response_format"] = rf.clone();
+        }
+        if let Some(tc) = &request.tool_choice {
+            body["tool_choice"] = tc.clone();
         }
         if let Some(fields) = request.native_cache_fields.as_ref() {
             merge_top_level(&mut body, fields).map_err(|_| RenderError::InvalidRenderPlan {

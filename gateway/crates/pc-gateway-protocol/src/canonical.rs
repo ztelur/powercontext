@@ -33,6 +33,12 @@ pub struct CanonicalRequest {
     /// before_release 后才向客户端释放；流式的是上游接收路径。
     #[serde(default)]
     pub stream: bool,
+    /// 结构化输出约束（response_format），原样透传。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_format: Option<serde_json::Value>,
+    /// 工具选择策略（tool_choice），原样透传。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

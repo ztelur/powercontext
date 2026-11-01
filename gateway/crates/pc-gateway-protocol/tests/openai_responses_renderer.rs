@@ -33,6 +33,8 @@ fn request() -> CanonicalRequest {
             max_output_tokens: 16,
         },
         stream: false,
+        response_format: None,
+        tool_choice: None,
     }
 }
 
@@ -84,6 +86,8 @@ fn responses_items_pass_through_verbatim() {
             max_output_tokens: 16,
         },
         stream: false,
+        response_format: None,
+        tool_choice: None,
     };
     let p = OpenAiResponsesRenderer.render(&req, None).unwrap();
     let v: serde_json::Value = serde_json::from_slice(&p.bytes).unwrap();
@@ -124,6 +128,8 @@ fn typed_content_parts_pass_through_as_array() {
             max_output_tokens: 16,
         },
         stream: false,
+        response_format: None,
+        tool_choice: None,
     };
     let p = OpenAiResponsesRenderer.render(&req, None).unwrap();
     let v: serde_json::Value = serde_json::from_slice(&p.bytes).unwrap();

@@ -34,6 +34,13 @@ struct OpenAiChatRequest {
     tools: Vec<serde_json::Value>,
     #[serde(default)]
     max_tokens: Option<u32>,
+    /// 优先于 max_tokens（OpenAI 新字段；两者并存时以此为准）。
+    #[serde(default)]
+    max_completion_tokens: Option<u32>,
+    #[serde(default)]
+    response_format: Option<serde_json::Value>,
+    #[serde(default)]
+    tool_choice: Option<serde_json::Value>,
     #[serde(default)]
     stream: Option<bool>,
 }
@@ -60,6 +67,10 @@ struct OpenAiResponsesRequest {
     tools: Vec<serde_json::Value>,
     #[serde(default)]
     max_output_tokens: Option<u32>,
+    #[serde(default)]
+    response_format: Option<serde_json::Value>,
+    #[serde(default)]
+    tool_choice: Option<serde_json::Value>,
     #[serde(default)]
     stream: Option<bool>,
 }
@@ -248,9 +259,14 @@ fn to_canonical_chat(chat: OpenAiChatRequest) -> Result<CanonicalRequest, String
         instructions: None,
         native_cache_fields: None,
         output_limits: OutputLimits {
-            max_output_tokens: chat.max_tokens.unwrap_or(1024),
+            max_output_tokens: chat
+                .max_completion_tokens
+                .or(chat.max_tokens)
+                .unwrap_or(1024),
         },
         stream: chat.stream.unwrap_or(false),
+        response_format: chat.response_format,
+        tool_choice: chat.tool_choice,
     })
 }
 
@@ -303,6 +319,8 @@ fn to_canonical_responses(r: OpenAiResponsesRequest) -> Result<CanonicalRequest,
             max_output_tokens: r.max_output_tokens.unwrap_or(1024),
         },
         stream: r.stream.unwrap_or(false),
+        response_format: r.response_format,
+        tool_choice: r.tool_choice,
     })
 }
 
