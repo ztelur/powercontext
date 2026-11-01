@@ -31,9 +31,18 @@ use tokio::net::UnixStream;
 
 pub type SharedProxy = (Arc<AppState>, ProxyState);
 
+fn default_body_limit() -> usize {
+    std::env::var("PC_GATEWAY_MAX_BODY_BYTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(16 * 1024 * 1024)
+}
+
 #[derive(Clone)]
 pub struct ProxyState {
     inner: Option<Arc<ProxyInner>>,
+    /// 代理路径的 body 字节上限（与中间件/ingress 同一配置值）。
+    max_body_bytes: usize,
 }
 
 struct ProxyInner {
@@ -54,11 +63,12 @@ impl ProxyState {
                         socket: PathBuf::from(sock),
                         client,
                     })),
+                    max_body_bytes: default_body_limit(),
                 }
             }
             Err(_) => {
                 tracing::info!("proxy: no UDS configured; standalone mode");
-                Self { inner: None }
+                Self { inner: None, max_body_bytes: default_body_limit() }
             }
         }
     }
@@ -102,6 +112,12 @@ pub async fn fallback(State((_, proxy)): State<SharedProxy>, req: Request) -> Re
     };
 
     let (parts, body) = req.into_parts();
+    // P2 review：代理路径的 body 也受配置上限约束。
+    // chunked 分帧没有 Content-Length，中间件预检无法拦截；
+    // 在这里用 Limited 包装 body，超限即截断 → 上游收到不完整请求并报错。
+    let limited_body = axum::body::Body::new(
+        http_body_util::Limited::new(body, proxy.max_body_bytes)
+    );
     // hyper legacy client 要求绝对 URI；UDS 连接器忽略 host，用占位 authority。
     let path_q = parts
         .uri
@@ -125,7 +141,7 @@ pub async fn fallback(State((_, proxy)): State<SharedProxy>, req: Request) -> Re
             headers.insert("host", HeaderValue::from_static("powercontext"));
         }
     }
-    let hyper_req = match fwd.body(body) {
+    let hyper_req = match fwd.body(limited_body) {
         Ok(r) => r,
         Err(e) => {
             return (
