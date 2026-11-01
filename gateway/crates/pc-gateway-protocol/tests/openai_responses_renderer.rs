@@ -35,6 +35,7 @@ fn request() -> CanonicalRequest {
         stream: false,
         response_format: None,
         tool_choice: None,
+        store: None,
     }
 }
 
@@ -88,6 +89,7 @@ fn responses_items_pass_through_verbatim() {
         stream: false,
         response_format: None,
         tool_choice: None,
+        store: None,
     };
     let p = OpenAiResponsesRenderer.render(&req, None).unwrap();
     let v: serde_json::Value = serde_json::from_slice(&p.bytes).unwrap();
@@ -130,6 +132,7 @@ fn typed_content_parts_pass_through_as_array() {
         stream: false,
         response_format: None,
         tool_choice: None,
+        store: None,
     };
     let p = OpenAiResponsesRenderer.render(&req, None).unwrap();
     let v: serde_json::Value = serde_json::from_slice(&p.bytes).unwrap();
@@ -167,6 +170,7 @@ fn structured_output_via_text_field_reaches_wire() {
             }
         })),
         tool_choice: None,
+        store: None,
     };
     let p = OpenAiResponsesRenderer.render(&req, None).unwrap();
     let v: serde_json::Value = serde_json::from_slice(&p.bytes).unwrap();

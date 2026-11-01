@@ -39,6 +39,9 @@ pub struct CanonicalRequest {
     /// 工具选择策略（tool_choice），原样透传。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<serde_json::Value>,
+    /// Responses 的保留设置（store）。#2313 要求 openai-responses 目标显式 store:false。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

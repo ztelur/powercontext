@@ -68,7 +68,10 @@ impl ProxyState {
             }
             Err(_) => {
                 tracing::info!("proxy: no UDS configured; standalone mode");
-                Self { inner: None, max_body_bytes: default_body_limit() }
+                Self {
+                    inner: None,
+                    max_body_bytes: default_body_limit(),
+                }
             }
         }
     }
@@ -115,9 +118,8 @@ pub async fn fallback(State((_, proxy)): State<SharedProxy>, req: Request) -> Re
     // P2 review：代理路径的 body 也受配置上限约束。
     // chunked 分帧没有 Content-Length，中间件预检无法拦截；
     // 在这里用 Limited 包装 body，超限即截断 → 上游收到不完整请求并报错。
-    let limited_body = axum::body::Body::new(
-        http_body_util::Limited::new(body, proxy.max_body_bytes)
-    );
+    let limited_body =
+        axum::body::Body::new(http_body_util::Limited::new(body, proxy.max_body_bytes));
     // hyper legacy client 要求绝对 URI；UDS 连接器忽略 host，用占位 authority。
     let path_q = parts
         .uri

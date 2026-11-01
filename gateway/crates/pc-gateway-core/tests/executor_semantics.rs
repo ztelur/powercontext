@@ -211,6 +211,7 @@ fn call(degrade: DegradePolicy) -> ManagedCall {
             stream: false,
             response_format: None,
             tool_choice: None,
+            store: None,
         },
         target_url: "http://upstream.invalid/v1/chat/completions".into(),
         headers: vec![("authorization".into(), "Bearer secret".into())],
@@ -1022,7 +1023,7 @@ fn chrono_now_rfc3339_plus_ms(offset_ms: i64) -> String {
     let (h, m, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
     // 简化：用 2026 年作为基准（测试环境时间在此附近）
     let base_days = 20648; // 2026-07-01 以来的天数（近似）
-    let year = 2026 + ((days + base_days) / 365) as i64;
+    let year = 2026 + ((days + base_days) / 365);
     let day_of_year = (days + base_days) % 365;
     let month = (day_of_year / 30 + 1).min(12);
     let day = (day_of_year % 30 + 1).min(28);

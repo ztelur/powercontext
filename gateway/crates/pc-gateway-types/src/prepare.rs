@@ -32,6 +32,34 @@ pub struct PrepareContextRequest {
     pub max_bytes: u32,
     #[serde(default)]
     pub include_reuse: bool,
+    /// #2313 契约：限定召回家族。reuse 只支持 atomic-memory；
+    /// 不指定 assembly 时 Core 默认召回 Experience/Topic → check 阶段拒绝。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assembly: Option<ContextAssembly>,
+}
+
+/// 召回组合：限定家族和条目数。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextAssembly {
+    pub sections: Vec<AssemblySection>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssemblySection {
+    pub family: String,
+    pub limit: u32,
+}
+
+impl ContextAssembly {
+    /// memory-only assembly（只召回 Atomic Memory）：#2313 支持的唯一 reuse 家族。
+    pub fn memory_only() -> Self {
+        Self {
+            sections: vec![AssemblySection {
+                family: "memory".into(),
+                limit: 8,
+            }],
+        }
+    }
 }
 
 fn default_max_bytes() -> u32 {

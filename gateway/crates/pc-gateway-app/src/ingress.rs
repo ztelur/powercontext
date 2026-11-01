@@ -73,6 +73,9 @@ struct OpenAiResponsesRequest {
     text: Option<serde_json::Value>,
     #[serde(default)]
     tool_choice: Option<serde_json::Value>,
+    /// #2313 要求 openai-responses 目标显式 store:false。
+    #[serde(default)]
+    store: Option<bool>,
     #[serde(default)]
     stream: Option<bool>,
 }
@@ -269,6 +272,7 @@ fn to_canonical_chat(chat: OpenAiChatRequest) -> Result<CanonicalRequest, String
         stream: chat.stream.unwrap_or(false),
         response_format: chat.response_format,
         tool_choice: chat.tool_choice,
+        store: None,
     })
 }
 
@@ -324,6 +328,7 @@ fn to_canonical_responses(r: OpenAiResponsesRequest) -> Result<CanonicalRequest,
         // Responses 的结构化输出在 text.format，不在 response_format（Chat 字段）。
         response_format: r.text,
         tool_choice: r.tool_choice,
+        store: r.store,
     })
 }
 

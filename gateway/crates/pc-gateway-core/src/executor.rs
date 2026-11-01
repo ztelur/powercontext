@@ -364,6 +364,9 @@ where
                 query,
                 max_bytes: 8192,
                 include_reuse: true,
+                // P2 review：限定 memory-only（#2313 reuse 只支持 atomic-memory），
+                // 防止 Experience/Topic 加入后 check 拒绝导致注入静默失效。
+                assembly: Some(pc_gateway_types::ContextAssembly::memory_only()),
             })
             .await
         {
