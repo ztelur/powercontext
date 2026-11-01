@@ -99,7 +99,9 @@ pub struct Executor<G, T> {
 /// 单次发送尝试的准入凭证。
 struct Admission {
     binding: String,
-    valid_until_ms: Option<u64>,
+    /// 截止时间（Unix 毫秒）。解析失败 = 0 = 立即过期（fail-closed，
+    /// 不能因无法解析就当作没有截止时间照常发送）。
+    valid_until_ms: u64,
 }
 
 impl<G, T> Executor<G, T>
@@ -183,7 +185,7 @@ where
             Ok(result) => match result.decision {
                 CheckDecision::Allow => Admission {
                     binding: unwrap_binding(result.binding),
-                    valid_until_ms: parse_rfc3339_ms(&result.valid_until),
+                    valid_until_ms: parse_rfc3339_ms(&result.valid_until).unwrap_or(0),
                 },
                 CheckDecision::Block => {
                     return ManagedOutcome::Blocked {
@@ -205,11 +207,9 @@ where
             loop {
                 attempt += 1;
                 evidence.record_attempt(attempt);
-                // P1-4：发送前验 valid_until。
-                if let Some(deadline) = current.valid_until_ms {
-                    if now_ms() >= deadline {
-                        return ManagedOutcome::AdmissionExpired;
-                    }
+                // P1-4：发送前验 valid_until（解析失败=0=立即过期，fail-closed）。
+                if now_ms() >= current.valid_until_ms {
+                    return ManagedOutcome::AdmissionExpired;
                 }
                 let send = AdmittedSend {
                     binding: current.binding.clone(),
@@ -247,7 +247,7 @@ where
                             Ok(r) if r.decision == CheckDecision::Allow => {
                                 current = Admission {
                                     binding: unwrap_binding(r.binding),
-                                    valid_until_ms: parse_rfc3339_ms(&r.valid_until),
+                                    valid_until_ms: parse_rfc3339_ms(&r.valid_until).unwrap_or(0),
                                 };
                             }
                             Ok(r) if r.decision == CheckDecision::Block => {
@@ -291,11 +291,10 @@ where
             Err(e) => ManagedOutcome::GatePaused(classify_gate_error(e)),
             Ok(result) => match result.decision {
                 CheckDecision::Allow => {
-                    // P1-4：释放前（含沉淀之后）验 release verdict 的 valid_until。
-                    if let Some(deadline) = parse_rfc3339_ms(&result.valid_until) {
-                        if now_ms() >= deadline {
-                            return ManagedOutcome::AdmissionExpired;
-                        }
+                    // P1-4：释放前验 release verdict 的 valid_until（fail-closed）。
+                    let release_deadline = parse_rfc3339_ms(&result.valid_until).unwrap_or(0);
+                    if now_ms() >= release_deadline {
+                        return ManagedOutcome::AdmissionExpired;
                     }
                     if call.sediment {
                         let transcript = serde_json::json!({
@@ -320,6 +319,10 @@ where
                         };
                         if let Err(e) = self.gate.capture(capture).await {
                             evidence.record_not_sent(0, &format!("sediment_failed:{e}"));
+                        }
+                        // P1-4 残留：capture 完成后复核——沉淀耗时可能跨越截止时间。
+                        if now_ms() >= release_deadline {
+                            return ManagedOutcome::AdmissionExpired;
                         }
                     }
                     ManagedOutcome::Released {

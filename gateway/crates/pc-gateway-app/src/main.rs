@@ -169,8 +169,8 @@ async fn shutdown_signal() {
 /// 查询失败 → 不允许（fail-closed）。
 async fn resolve_degradation(link: link::CoreLink) -> bool {
     use pc_gateway_core::GateClient;
-    match link.capabilities().await {
-        Ok(caps) => {
+    match tokio::time::timeout(std::time::Duration::from_secs(10), link.capabilities()).await {
+        Ok(Ok(caps)) => {
             let enforcing = caps
                 .get("context_protection")
                 .and_then(|cp| cp.get("enforcing"))
@@ -184,8 +184,12 @@ async fn resolve_degradation(link: link::CoreLink) -> bool {
             );
             allowed
         }
-        Err(e) => {
-            tracing::warn!(error = %e, "capabilities unreachable; degradation disabled (fail-closed)");
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "capabilities error; degradation disabled (fail-closed)");
+            false
+        }
+        Err(_) => {
+            tracing::warn!("capabilities timeout (10s); degradation disabled (fail-closed)");
             false
         }
     }

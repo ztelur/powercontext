@@ -40,6 +40,8 @@ impl HttpGateClient {
             base_url: base_url.into().trim_end_matches('/').to_string(),
             client: reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
+                .timeout(std::time::Duration::from_secs(10))
+                .connect_timeout(std::time::Duration::from_secs(3))
                 .build()
                 .expect("reqwest client build"),
             token: token.filter(|t| !t.is_empty()),
