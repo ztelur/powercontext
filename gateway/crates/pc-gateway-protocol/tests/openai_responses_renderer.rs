@@ -138,3 +138,39 @@ fn typed_content_parts_pass_through_as_array() {
     assert_eq!(content[0]["type"], "input_text");
     assert_eq!(content[1]["type"], "input_image");
 }
+
+#[test]
+fn structured_output_via_text_field_reaches_wire() {
+    // PR review：Responses 的结构化输出在 text: {format: ...}，不在 response_format。
+    // 经 Gateway 后 text.format 必须原样到达上游载荷。
+    let req = CanonicalRequest {
+        model: "m".into(),
+        messages: vec![CanonicalMessage {
+            role: Role::User,
+            content: vec![serde_json::json!("给我一个 JSON")],
+            content_null: false,
+            tool_calls: None,
+            tool_call_id: None,
+        }],
+        tools: vec![],
+        instructions: None,
+        native_cache_fields: None,
+        output_limits: OutputLimits { max_output_tokens: 64 },
+        stream: false,
+        response_format: Some(serde_json::json!({
+            "format": {
+                "type": "json_schema",
+                "name": "my_output",
+                "schema": {"type": "object", "properties": {"result": {"type": "string"}}}
+            }
+        })),
+        tool_choice: None,
+    };
+    let p = OpenAiResponsesRenderer.render(&req, None).unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&p.bytes).unwrap();
+    // 上游载荷必须有 "text"（不是 "response_format"——那是 Chat 字段）
+    assert!(v.get("text").is_some(), "text 字段必须存在于 Responses wire body");
+    assert_eq!(v["text"]["format"]["type"], "json_schema");
+    assert_eq!(v["text"]["format"]["name"], "my_output");
+    assert!(v.get("response_format").is_none(), "response_format 不得出现在 Responses wire body");
+}

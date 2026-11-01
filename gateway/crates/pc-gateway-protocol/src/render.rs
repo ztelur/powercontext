@@ -259,7 +259,7 @@ impl WireRenderer for OpenAiResponsesRenderer {
             body["tools"] = serde_json::json!(request.tools);
         }
         if let Some(rf) = &request.response_format {
-            body["response_format"] = rf.clone();
+            body["text"] = rf.clone();
         }
         if let Some(tc) = &request.tool_choice {
             body["tool_choice"] = tc.clone();

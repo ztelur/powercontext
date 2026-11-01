@@ -67,8 +67,10 @@ struct OpenAiResponsesRequest {
     tools: Vec<serde_json::Value>,
     #[serde(default)]
     max_output_tokens: Option<u32>,
+    /// Responses 的结构化输出参数：text: { format: {...} }。
+    /// 注意：Responses API 没有顶层 response_format（那是 Chat 字段）。
     #[serde(default)]
-    response_format: Option<serde_json::Value>,
+    text: Option<serde_json::Value>,
     #[serde(default)]
     tool_choice: Option<serde_json::Value>,
     #[serde(default)]
@@ -319,7 +321,8 @@ fn to_canonical_responses(r: OpenAiResponsesRequest) -> Result<CanonicalRequest,
             max_output_tokens: r.max_output_tokens.unwrap_or(1024),
         },
         stream: r.stream.unwrap_or(false),
-        response_format: r.response_format,
+        // Responses 的结构化输出在 text.format，不在 response_format（Chat 字段）。
+        response_format: r.text,
         tool_choice: r.tool_choice,
     })
 }
