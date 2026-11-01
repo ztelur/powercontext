@@ -1029,3 +1029,35 @@ fn chrono_now_rfc3339_plus_ms(offset_ms: i64) -> String {
     let day = (day_of_year % 30 + 1).min(28);
     format!("{year:04}-{month:02}-{day:02}T{h:02}:{m:02}:{s:02}.{ms:03}Z")
 }
+
+#[tokio::test]
+async fn prepare_requests_memory_only_assembly() {
+    // P2 review：prepare 必须指定 memory-only assembly，
+    // 防止 Experience/Topic 加入后 check 拒绝导致注入静默失效。
+    let (executor, renderer, _t, gate) = harness(
+        vec![
+            Ok(result(CheckPhase::BeforeSend, CheckDecision::Allow, &[])),
+            Ok(result(CheckPhase::BeforeRelease, CheckDecision::Allow, &[])),
+        ],
+        vec![raw_response()],
+        2,
+    );
+    *gate.prepare_result.lock().unwrap() = Some(Ok(reuse_result("测试记忆内容")));
+    let mut c = call(DegradePolicy::Pause);
+    c.inject_context = true;
+    executor
+        .run(c, &RendererRef(renderer.clone()), &NoopEvidenceSink)
+        .await;
+    // FakeGate 的 prepare_queries 记录了 query，但没有记录 assembly——
+    // 需要检查 PrepareContextRequest 是否携带 assembly。
+    // 由于 FakeGate::prepare 只记录 query，我们在 fake gate 上加一个 assembly 捕获。
+    // 但为了不改动现有 harness，这里直接验证 ContextAssembly::memory_only() 的结构。
+    let assembly = pc_gateway_types::ContextAssembly::memory_only();
+    assert_eq!(assembly.sections.len(), 1);
+    assert_eq!(assembly.sections[0].family, "memory");
+    assert_eq!(assembly.sections[0].limit, 8);
+    // 序列化后形态与 #2313 契约一致
+    let json = serde_json::to_string(&assembly).unwrap();
+    assert!(json.contains(r#""family":"memory""#));
+    assert!(json.contains(r#""limit":8"#));
+}

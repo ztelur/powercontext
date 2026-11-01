@@ -186,3 +186,66 @@ fn structured_output_via_text_field_reaches_wire() {
         "response_format 不得出现在 Responses wire body"
     );
 }
+
+#[test]
+fn store_false_reaches_responses_wire_body() {
+    // P1 review：#2313 要求 openai-responses 目标显式 store:false。
+    // 经网关后 store 必须原样到达上游载荷，否则 Core 返回 409。
+    let req = CanonicalRequest {
+        model: "m".into(),
+        messages: vec![CanonicalMessage {
+            role: Role::User,
+            content: vec![serde_json::json!("hi")],
+            content_null: false,
+            tool_calls: None,
+            tool_call_id: None,
+        }],
+        tools: vec![],
+        instructions: None,
+        native_cache_fields: None,
+        output_limits: OutputLimits {
+            max_output_tokens: 64,
+        },
+        stream: false,
+        response_format: None,
+        tool_choice: None,
+        store: Some(false),
+    };
+    let p = OpenAiResponsesRenderer.render(&req, None).unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&p.bytes).unwrap();
+    assert_eq!(
+        v["store"], false,
+        "store:false 必须到达 Responses wire body"
+    );
+}
+
+#[test]
+fn store_absent_omitted_from_wire_body() {
+    // 调用方没传 store → 线格式不出现该字段（不冒认默认值）。
+    let req = CanonicalRequest {
+        model: "m".into(),
+        messages: vec![CanonicalMessage {
+            role: Role::User,
+            content: vec![serde_json::json!("hi")],
+            content_null: false,
+            tool_calls: None,
+            tool_call_id: None,
+        }],
+        tools: vec![],
+        instructions: None,
+        native_cache_fields: None,
+        output_limits: OutputLimits {
+            max_output_tokens: 64,
+        },
+        stream: false,
+        response_format: None,
+        tool_choice: None,
+        store: None,
+    };
+    let p = OpenAiResponsesRenderer.render(&req, None).unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&p.bytes).unwrap();
+    assert!(
+        v.get("store").is_none(),
+        "未传 store 时不得出现在 wire body"
+    );
+}
