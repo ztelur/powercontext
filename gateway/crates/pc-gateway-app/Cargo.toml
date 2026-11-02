@@ -40,4 +40,5 @@ reqwest = { workspace = true }
 hyper = { workspace = true }
 tower = { workspace = true }
 hyper-util = { workspace = true }
+http-body = { workspace = true }
 http-body-util = { workspace = true }

@@ -22,6 +22,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use tokio::sync::Semaphore;
 
 pub struct ResourceLimits {
@@ -96,8 +97,51 @@ impl GatewayMiddleware for ResourceLimits {
             };
 
             let resp = next.run(req).await;
-            drop(permit); // 显式归还（作用域结束也会归还，这里表达意图）
-            resp
+            // P2 review：许可必须绑定到响应 body 的生命周期，不能在头返回时释放。
+            // 流式代理（MCP/SSE）的 body 在头之后仍在传输；在头返回时 drop 许可
+            // 会让活跃的 SSE 连绕不占并发配额。
+            let (parts, body) = resp.into_parts();
+            let permit_body = PermitBody::wrap(body, permit);
+            axum::response::Response::from_parts(parts, permit_body)
         })
+    }
+}
+
+/// 包装响应 body，持有并发许可直到 body 完成/失败/断开。
+struct PermitBody {
+    inner: axum::body::Body,
+    _permit: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+impl PermitBody {
+    fn wrap(
+        inner: axum::body::Body,
+        permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    ) -> axum::body::Body {
+        axum::body::Body::new(Self {
+            inner,
+            _permit: permit,
+        })
+    }
+}
+
+impl http_body::Body for PermitBody {
+    type Data = axum::body::Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        Pin::new(&mut self.inner).poll_frame(cx)
+        // permit 随 self（即 body）的 Drop 释放——body 消费完/连接断开时触发
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
     }
 }

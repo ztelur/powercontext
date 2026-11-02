@@ -33,8 +33,9 @@ use pc_gateway_evidence::EvidenceSink;
 use pc_gateway_protocol::{CanonicalRequest, WireRenderer};
 use pc_gateway_transport::{AdmittedSend, SendOutcome, Transport};
 use pc_gateway_types::{
-    parse_rfc3339_ms, CaptureContentSourceRequest, CheckDecision, ContextCheckRequest,
-    ModelJsonPayload, ModelJsonTextLocation, PrepareContextRequest, PreparedContextLocation,
+    parse_rfc3339_ms, CaptureContentSourceRequest, CheckDecision, CheckPhase, ContextCheckRequest,
+    ContextCheckResult, ModelJsonPayload, ModelJsonTextLocation, PrepareContextRequest,
+    PreparedContextLocation,
 };
 use std::collections::BTreeMap;
 use std::num::NonZeroU32;
@@ -183,9 +184,12 @@ where
                 };
             }
             Ok(result) => match result.decision {
-                CheckDecision::Allow => Admission {
-                    binding: unwrap_binding(result.binding),
-                    valid_until_ms: parse_rfc3339_ms(&result.valid_until).unwrap_or(0),
+                CheckDecision::Allow => match validate_allow(&result, CheckPhase::BeforeSend) {
+                    Ok((binding, deadline)) => Admission {
+                        binding,
+                        valid_until_ms: deadline,
+                    },
+                    Err(outcome) => return outcome,
                 },
                 CheckDecision::Block => {
                     return ManagedOutcome::Blocked {
@@ -245,10 +249,15 @@ where
                         };
                         match self.gate.check(recheck).await {
                             Ok(r) if r.decision == CheckDecision::Allow => {
-                                current = Admission {
-                                    binding: unwrap_binding(r.binding),
-                                    valid_until_ms: parse_rfc3339_ms(&r.valid_until).unwrap_or(0),
-                                };
+                                match validate_allow(&r, CheckPhase::BeforeSend) {
+                                    Ok((binding, deadline)) => {
+                                        current = Admission {
+                                            binding,
+                                            valid_until_ms: deadline,
+                                        };
+                                    }
+                                    Err(outcome) => return outcome,
+                                }
                             }
                             Ok(r) if r.decision == CheckDecision::Block => {
                                 return ManagedOutcome::Blocked {
@@ -291,6 +300,12 @@ where
             Err(e) => ManagedOutcome::GatePaused(classify_gate_error(e)),
             Ok(result) => match result.decision {
                 CheckDecision::Allow => {
+                    // P2 review：验证完整 allow（schema/phase/coverage/binding）。
+                    let (_release_binding_used, _release_deadline_used) =
+                        match validate_allow(&result, CheckPhase::BeforeRelease) {
+                            Ok(v) => v,
+                            Err(outcome) => return outcome,
+                        };
                     // P1-4：释放前验 release verdict 的 valid_until（fail-closed）。
                     let release_deadline = parse_rfc3339_ms(&result.valid_until).unwrap_or(0);
                     if now_ms() >= release_deadline {
@@ -445,10 +460,6 @@ where
     }
 }
 
-fn unwrap_binding(binding: Option<String>) -> String {
-    binding.unwrap_or_else(|| "missing-binding".to_string())
-}
-
 fn content_headers(headers: &[(String, String)], content_type: &str) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
     out.insert("content-type".to_string(), content_type.to_string());
@@ -460,6 +471,46 @@ fn content_headers(headers: &[(String, String)], content_type: &str) -> BTreeMap
         out.insert(lower, v.clone());
     }
     out
+}
+
+/// 验证 allow 响应的完整性：schema/phase/coverage/binding 四项缺一不可。
+/// 契约："Only allow with complete coverage permits the corresponding phase."
+/// 畸形对端返回不完整 allow 时必须暂停（fail-closed），不得替代或放行。
+fn validate_allow(
+    result: &ContextCheckResult,
+    expected_phase: CheckPhase,
+) -> Result<(String, u64), ManagedOutcome> {
+    // 1. schema 必须匹配
+    if result.schema != pc_gateway_types::CONTEXT_CHECK_SCHEMA {
+        return Err(ManagedOutcome::GatePaused(format!(
+            "malformed_verdict: schema mismatch: {}",
+            result.schema
+        )));
+    }
+    // 2. phase 必须与请求阶段一致
+    if result.phase != expected_phase {
+        return Err(ManagedOutcome::GatePaused(format!(
+            "malformed_verdict: phase mismatch: expected {expected_phase:?}, got {:?}",
+            result.phase
+        )));
+    }
+    // 3. coverage.complete 必须为 true
+    if !result.coverage.complete {
+        return Err(ManagedOutcome::GatePaused(
+            "malformed_verdict: incomplete coverage on allow".into(),
+        ));
+    }
+    // 4. binding 必须非空（不得用 missing-binding 替代）
+    let binding = result
+        .binding
+        .as_deref()
+        .filter(|b| !b.is_empty())
+        .ok_or_else(|| {
+            ManagedOutcome::GatePaused("malformed_verdict: allow without binding".into())
+        })?;
+    // 5. valid_until 必须可解析（fail-closed 在 unwrap_or(0) 已处理）
+    let deadline = parse_rfc3339_ms(&result.valid_until).unwrap_or(0);
+    Ok((binding.to_string(), deadline))
 }
 
 fn classify_gate_error(e: GateError) -> String {
